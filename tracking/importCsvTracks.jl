@@ -119,7 +119,9 @@ function _ict_mapping(params::Dict{String,Any})
         isempty(v) || (map[k] = v)          # a non-empty field overrides the template
     end
     for k in ("frameBase", "skipRows")
-        haskey(params, k) && (map[k] = Int(params[k]))
+        # `frameBase` comes from a select, so it arrives as a STRING ("0"/"1"). An int slider for a
+        # two-value choice was the wrong control — it read as a range of numbers to tune.
+        haskey(params, k) && (map[k] = something(tryparse(Int, string(params[k])), 0))
     end
     u = string(get(params, "spotUnit", ""))
     isempty(u) || (map["spotUnit"] = u)
@@ -130,16 +132,35 @@ function Cecelia._run_task(::ImportCsvTracks, img::Cecelia.CciaImage, params::Di
                            on_log::Function      = line -> println(line),
                            on_progress::Function = (n, t) -> nothing,
                            on_process::Function  = _ -> nothing)
-    vn     = string(get(params, "valueName", Cecelia.VERSIONED_DEFAULT_VAL))
-    csv    = string(get(params, "csvPath", ""))
-    outcol = string(get(params, "outColumn", "trackTools.track_id"))
-    maxd   = Float64(get(params, "maxDistance", 10.0))
+    mode = string(get(params, "mode", "attach"))
+    vn   = string(get(params, "valueName", Cecelia.VERSIONED_DEFAULT_VAL))
+    csv  = string(get(params, "csvPath", ""))
+    maxd = Float64(get(params, "maxDistance", 10.0))
+    outvn = strip(string(get(params, "outputValueName", "")))
+    mode == "create" && isempty(outvn) &&
+        (on_log("[ERROR] Give the new segmentation a name"); return nothing)
+
+    # `track_id` is THE column, not a choice. Everything downstream reads exactly that name —
+    # `track_props`, `tracking.track_measures`, `behaviour.hmm_transitions`, `is_tracked` — so writing
+    # anywhere else would produce a column no other task can use, and offering the name as a param
+    # would invite several rival track_id columns on one image. Importing tracks is an ALTERNATIVE to
+    # running `tracking.bayesian_tracking`, so it writes where that writes.
+    outcol = "track_id"
 
     isempty(csv) && (on_log("[ERROR] No CSV path given"); return nothing)
     isfile(csv)  || (on_log("[ERROR] CSV not found: $csv"); return nothing)
 
-    path = Cecelia.img_label_props_path(img, vn)
-    isfile(path) || (on_log("[ERROR] No label props for valueName='$vn'"); return nothing)
+    # attach → an EXISTING segmentation's table; create → a new one, which must not already exist.
+    path = if mode == "create"
+        p = joinpath(Cecelia.img_label_props_dir(img), "$outvn.h5ad")
+        isfile(p) && (on_log("[ERROR] '$outvn' already exists — pick another name"); return nothing)
+        p
+    else
+        p = Cecelia.img_label_props_path(img, vn)
+        isfile(p) || (on_log("[ERROR] No label props for valueName='$vn'. Import without a " *
+                             "segmentation by switching to 'Create from the file'."); return nothing)
+        p
+    end
 
     map = try
         _ict_mapping(params)
@@ -159,15 +180,25 @@ function Cecelia._run_task(::ImportCsvTracks, img::Cecelia.CciaImage, params::Di
     on_progress(0, 1)
     script = joinpath(@__DIR__, "importCsvTracks_run.py")
     ok = Cecelia.run_py(script,
-            (; labelPropsPath = path, csvPath = csv, outColumn = outcol,
+            (; labelPropsPath = path, outPath = path, mode = mode, csvPath = csv, outColumn = outcol,
                maxDistance = maxd, physicalSizesZYX = sizes, mapping = map,
                delimiter = _ict_delimiter(csv)),
             Cecelia.task_run_dir(img._dir);
             on_log = on_log, on_progress = on_progress, on_process = on_process)
     ok || (on_log("[ERROR] Track import failed"); return nothing)
+
+    # A created segmentation has to be REGISTERED, or nothing can find it: `img_value_names` lists the
+    # keys of ccid.json's `label_props`, so an .h5ad on disk that nobody recorded is invisible to every
+    # picker, `pop_df` and `track_props`.
+    if mode == "create"
+        img.label_props[outvn] = "$outvn.h5ad"
+        Cecelia.save!(img)
+        on_log("[INFO] Registered segmentation '$outvn' (points only — motility, no shape/intensity)")
+    end
     on_progress(1, 1)
 
-    Dict{String,Any}("outputColumn" => outcol, "csvPath" => csv, "valueName" => vn,
+    Dict{String,Any}("outputColumn" => outcol, "csvPath" => csv,
+                     "valueName" => mode == "create" ? outvn : vn, "mode" => mode,
                      "template" => string(get(params, "template", "")))
 end
 
