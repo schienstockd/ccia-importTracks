@@ -78,21 +78,34 @@ Cecelia._needs_dynamic_options(::ImportCsvTracks) = true
 function Cecelia._inject_dynamic_options!(spec::Dict{String,Any}, ::ImportCsvTracks,
                                           form::AbstractDict)::Dict{String,Any}
     path = string(get(form, "csvPath", ""))
+
+    # Walk params + one level of section sub-params, applying `f` to each.
+    function _walk!(ps, f)
+        ps isa AbstractVector || return
+        for p in ps
+            p isa AbstractDict || continue
+            f(p)
+            _walk!(get(p, "params", nothing), f)
+        end
+    end
+
+    # NO visibility rule here any more, and the reason is worth stating because the first version got
+    # it wrong. "This export has no columns to map" reads like something only the server can know —
+    # but it is decided by the file's EXTENSION, which is a property of the string already sitting in
+    # the form. Hiding it from Julia meant it was only re-resolved when the user EDITED the path, so
+    # a form restored from a previous run, or redrawn after a run finished, showed the column mapping
+    # for an XML import (Dominik, on screen). Declared as `showIf` on the spec it is simply always
+    # right, because the frontend evaluates it on every render.
+    #
+    # What is left needs the file OPEN, which no spec field can express: the column names themselves.
+    # Suggestions only — the fields stay valid on their own.
     isempty(path) && return spec
     cols = _ict_headers(path; skip = Int(get(form, "skipRows", 0)))
     isempty(cols) && return spec
     opts = [Dict{String,Any}("label" => c, "value" => c) for c in cols]
-    # walk the spec (params + section sub-params) and attach the options to each column field
-    keys_wanted = Set(["trackColumn", "frameColumn", "xColumn", "yColumn", "zColumn"])
-    function _attach!(ps)
-        ps isa AbstractVector || return
-        for p in ps
-            p isa AbstractDict || continue
-            string(get(p, "key", "")) ∈ keys_wanted && (p["options"] = deepcopy(opts))
-            _attach!(get(p, "params", nothing))     # sections nest one level
-        end
-    end
-    _attach!(get(spec, "params", nothing))
+    colkeys = Set(["trackColumn", "frameColumn", "xColumn", "yColumn", "zColumn"])
+    _walk!(get(spec, "params", nothing),
+           p -> string(get(p, "key", "")) ∈ colkeys && (p["options"] = deepcopy(opts)))
     spec
 end
 
@@ -150,10 +163,24 @@ function Cecelia._run_task(::ImportCsvTracks, img::Cecelia.CciaImage, params::Di
     isempty(csv) && (on_log("[ERROR] No CSV path given"); return nothing)
     isfile(csv)  || (on_log("[ERROR] CSV not found: $csv"); return nothing)
 
-    # attach → an EXISTING segmentation's table; create → a new one, which must not already exist.
+    # attach → an EXISTING segmentation's table; create → its own.
     path = if mode == "create"
         p = joinpath(Cecelia.img_label_props_dir(img), "$outvn.h5ad")
-        isfile(p) && (on_log("[ERROR] '$outvn' already exists — pick another name"); return nothing)
+        # Refuse only a name that owns MASK PIXELS. The first version refused any existing name, which
+        # made the ordinary case impossible: re-importing a corrected file under the name you already
+        # gave it. Re-running a task over its own output is what every other task does, and an import
+        # is no different — the file on disk is the truth, so overwriting it is the update.
+        #
+        # What must still be refused is landing a points table on a name that has a real segmentation
+        # behind it (`img.labels`): the mask would stay, the measurements would be replaced by
+        # detections that have nothing to do with it, and every population scoped to that
+        # segmentation would silently start reading someone else's rows.
+        if haskey(img.labels, outvn)
+            on_log("[ERROR] '$outvn' is a segmentation with labels — importing points over it would " *
+                   "leave the mask and replace its cells. Pick another name.")
+            return nothing
+        end
+        isfile(p) && on_log("[INFO] Replacing the existing import '$outvn'")
         p
     else
         p = Cecelia.img_label_props_path(img, vn)
